@@ -1,0 +1,27 @@
+[project]
+name = "timeboost-auction-records"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "kosunghun317",email = "kosunghun317@kaist.ac.kr"}
+]
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "ipykernel (>=6.30.1,<7.0.0)",
+    "web3 (>=7.13.0,<8.0.0)",
+    "ruff (>=0.12.12,<0.13.0)",
+    "polars (>=1.33.0,<2.0.0)",
+    "tabulate (>=0.9.0,<0.10.0)",
+    "moccasin (>=0.4.2,<0.5.0)",
+    "scipy (>=1.16.1,<2.0.0)",
+    "matplotlib (>=3.10.6,<4.0.0)"
+]
+
+[tool.poetry]
+packages = [{include = "timeboost_auction_records", from = "src"}]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

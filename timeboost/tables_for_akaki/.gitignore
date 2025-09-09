@@ -1,0 +1,3 @@
+*.venv/
+.ruff_cache/
+timeboost_bids.csv
