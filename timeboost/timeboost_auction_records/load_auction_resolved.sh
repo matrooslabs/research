@@ -29,6 +29,14 @@ clickhouse client \
   ${CLICKHOUSE_PASSWORD:+--password="$CLICKHOUSE_PASSWORD"} \
   --query="CREATE DATABASE IF NOT EXISTS ${CLICKHOUSE_DB}"
 
+# Remove existing data so the table exactly matches the updated TSV
+clickhouse client \
+  --host     "$CLICKHOUSE_HOST" \
+  --port     "$CLICKHOUSE_PORT" \
+  --user     "$CLICKHOUSE_USER" \
+  ${CLICKHOUSE_PASSWORD:+--password="$CLICKHOUSE_PASSWORD"} \
+  --query="TRUNCATE TABLE IF EXISTS ${CLICKHOUSE_DB}.${CLICKHOUSE_TABLE}"
+
 # Import with header row
 cat "$TSV_FILE" \
 | clickhouse client \

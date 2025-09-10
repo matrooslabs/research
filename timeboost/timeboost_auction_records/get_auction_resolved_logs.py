@@ -322,7 +322,7 @@ async def fetch_worker(
 
 
 async def writer_worker_tsv(
-    out_path: str, queue: "asyncio.Queue[List[dict]]", batch_size: int
+    out_path: str, queue: "asyncio.Queue[List[dict]]", batch_size: int, existing_rounds: Optional[set[int]] = None
 ) -> None:
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     buffer: List[dict] = []
@@ -337,7 +337,22 @@ async def writer_worker_tsv(
                 wrote_header = True
             queue.task_done()
             break
-        buffer.extend(rows)
+        # Deduplicate against existing rounds if provided
+        if existing_rounds is None:
+            buffer.extend(rows)
+        else:
+            filtered: List[dict] = []
+            for r in rows:
+                try:
+                    rnd = int(r.get("round"))
+                except Exception:
+                    continue
+                if rnd in existing_rounds:
+                    continue
+                existing_rounds.add(rnd)
+                filtered.append(r)
+            if filtered:
+                buffer.extend(filtered)
         if len(buffer) >= batch_size:
             df = pl.DataFrame(buffer).select(DECODED_COLUMNS)
             with open(out_path, "ab") as f:
@@ -404,7 +419,7 @@ def main() -> None:
     parser.add_argument(
         "--rps",
         type=int,
-        default=50,
+        default=64,
         help="Global max requests per second across all workers (default 100)",
     )
     parser.add_argument(
@@ -418,6 +433,15 @@ def main() -> None:
         type=int,
         default=5000,
         help="Writer batch size before flushing TSV (default 5000)",
+    )
+    parser.add_argument(
+        "--dedupe-rounds-in-file",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "At startup, rewrite --out TSV to unique rounds (default: true). "
+            "Disable with --no-dedupe-rounds-in-file."
+        ),
     )
 
     args = parser.parse_args()
@@ -441,6 +465,49 @@ def main() -> None:
     topic0 = get_auction_resolved_topic0()
     topics = [topic0]
 
+    def load_existing_rounds_tsv(path: str) -> set[int]:
+        rounds: set[int] = set()
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                df = pl.read_csv(
+                    path,
+                    separator="\t",
+                    columns=["round"],
+                    infer_schema_length=0,
+                )
+                for (rnd,) in df.iter_rows():
+                    try:
+                        rounds.add(int(rnd))
+                    except Exception:
+                        continue
+        except Exception as e:
+            print(f"WARN: could not load existing keys from {path}: {e}")
+        return rounds
+
+    def dedupe_tsv_by_round_in_place(path: str) -> int:
+        try:
+            if not (os.path.exists(path) and os.path.getsize(path) > 0):
+                return 0
+            df = pl.read_csv(path, separator="\t")
+            if "round" not in df.columns:
+                return 0
+            before = df.height
+            df_dedup = df.unique(subset=["round"], keep="first")
+            removed = before - df_dedup.height
+            if removed <= 0:
+                return 0
+            # Preserve column order using DECODED_COLUMNS when present
+            ordered_cols = [c for c in DECODED_COLUMNS if c in df_dedup.columns]
+            ordered_cols += [c for c in df_dedup.columns if c not in ordered_cols]
+            df_dedup = df_dedup.select(ordered_cols)
+            tmp_path = path + ".tmp"
+            df_dedup.write_csv(tmp_path, separator="\t", include_header=True)
+            os.replace(tmp_path, path)
+            return removed
+        except Exception as e:
+            print(f"WARN: failed to dedupe {path}: {e}")
+            return 0
+
     async def run_async() -> None:
         jobs: asyncio.Queue[Tuple[int, int]] = asyncio.Queue()
         out_queue: asyncio.Queue[List[dict]] = asyncio.Queue()
@@ -453,9 +520,14 @@ def main() -> None:
             cur = to_b + 1
 
         limiter = AsyncRateLimiter(max_calls_per_sec=int(args.rps))
+        # Preload existing rounds to avoid duplicate rows across runs
+        existing_rounds = load_existing_rounds_tsv(args.out)
+        if existing_rounds:
+            print(f"Loaded {len(existing_rounds)} existing rounds from {args.out}")
+
         async with aiohttp.ClientSession() as session:
             writer_task = asyncio.create_task(
-                writer_worker_tsv(args.out, out_queue, int(args.flush_every))
+                writer_worker_tsv(args.out, out_queue, int(args.flush_every), existing_rounds)
             )
             workers = [
                 asyncio.create_task(
@@ -478,6 +550,12 @@ def main() -> None:
             await writer_task
             for t in workers:
                 t.cancel()
+
+    # Optionally rewrite TSV to unique rounds before starting async pipeline
+    if args.dedupe_rounds_in_file:
+        removed = dedupe_tsv_by_round_in_place(args.out)
+        if removed > 0:
+            print(f"Deduped {removed} duplicate rounds in {args.out}")
 
     asyncio.run(run_async())
 
