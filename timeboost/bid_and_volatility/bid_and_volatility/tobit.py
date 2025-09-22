@@ -294,3 +294,192 @@ def predict_latent(
 ) -> np.ndarray:
     X_arr = _as_2d(X, add_intercept=add_intercept)
     return X_arr @ beta
+
+
+# =========================== Heteroskedastic Tobit ===========================
+
+
+@dataclass
+class HeteroTobitResult:
+    beta: np.ndarray
+    gamma: np.ndarray
+    vcov: np.ndarray
+    se_beta: np.ndarray
+    se_gamma: np.ndarray
+    loglike: float
+    nobs: int
+    n_left: int
+    n_right: int
+    n_uncensored: int
+    success: bool
+    message: str
+    nit: int
+    aic: float
+    bic: float
+
+    def summary(self) -> Dict[str, object]:
+        return {
+            "beta": self.beta,
+            "gamma": self.gamma,
+            "se_beta": self.se_beta,
+            "se_gamma": self.se_gamma,
+            "loglike": self.loglike,
+            "nobs": self.nobs,
+            "n_left": self.n_left,
+            "n_right": self.n_right,
+            "n_uncensored": self.n_uncensored,
+            "success": self.success,
+            "message": self.message,
+            "nit": self.nit,
+            "aic": self.aic,
+            "bic": self.bic,
+        }
+
+
+def predict_sigma(Z: ArrayLike, gamma: np.ndarray, add_intercept_sigma: bool = True) -> np.ndarray:
+    Z_arr = _as_2d(Z, add_intercept=add_intercept_sigma)
+    log_sigma_i = Z_arr @ gamma
+    return np.exp(log_sigma_i)
+
+
+def fit_tobit_hetero(
+    y: ArrayLike,
+    X: ArrayLike,
+    Z: Optional[ArrayLike] = None,
+    *,
+    left: Optional[Union[float, np.ndarray]] = None,
+    right: Optional[Union[float, np.ndarray]] = None,
+    is_left_censored: Optional[np.ndarray] = None,
+    is_right_censored: Optional[np.ndarray] = None,
+    add_intercept: bool = True,
+    add_intercept_sigma: bool = True,
+    method: str = "BFGS",
+    maxiter: int = 1000,
+    tol: float = 1e-8,
+    use_numeric_hessian: bool = True,
+) -> HeteroTobitResult:
+    """
+    Heteroskedastic Tobit via MLE.
+
+    Mean: y*_i = X_i @ beta + u_i
+    Var:  u_i ~ N(0, sigma_i^2),  log(sigma_i) = Z_i @ gamma
+    """
+    y_arr = np.asarray(y, dtype=float).reshape(-1)
+    X_arr = _as_2d(X, add_intercept=add_intercept)
+    if Z is None:
+        Z_arr = np.ones((X_arr.shape[0], 1), dtype=float) if add_intercept_sigma else np.empty((X_arr.shape[0], 0))
+    else:
+        Z_arr = _as_2d(Z, add_intercept=add_intercept_sigma)
+
+    if X_arr.shape[0] != y_arr.shape[0] or Z_arr.shape[0] != y_arr.shape[0]:
+        raise ValueError("X, Z, and y must have the same number of rows")
+
+    is_left, is_right, mask_unc, left_arr, right_arr = _build_masks(
+        y_arr, left, right, is_left_censored, is_right_censored
+    )
+
+    # initialize from homoskedastic
+    theta0_homo = _init_params(y_arr, X_arr, mask_unc)
+    beta0 = theta0_homo[:-1]
+    log_sigma0 = float(theta0_homo[-1])
+    gamma0 = np.zeros(Z_arr.shape[1], dtype=float)
+    if gamma0.size > 0:
+        gamma0[0] = log_sigma0
+    theta0 = np.concatenate([beta0, gamma0])
+
+    p = X_arr.shape[1]
+    q = Z_arr.shape[1]
+
+    def nll(theta: np.ndarray) -> float:
+        beta = theta[:p]
+        gamma = theta[p : p + q]
+        xb = X_arr @ beta
+        log_sigma_i = Z_arr @ gamma
+        sigma_i = np.exp(log_sigma_i)
+
+        z_unc = (y_arr - xb) / sigma_i
+        z_left = (left_arr - xb) / sigma_i
+        z_right = (right_arr - xb) / sigma_i
+
+        ll = np.zeros_like(y_arr, dtype=float)
+        if mask_unc.any():
+            ll[mask_unc] = norm.logpdf(z_unc[mask_unc]) - log_sigma_i[mask_unc]
+        if is_left.any():
+            ll[is_left] = norm.logcdf(z_left[is_left])
+        if is_right.any():
+            ll[is_right] = norm.logsf(z_right[is_right])
+        return float(-np.sum(ll))
+
+    res = minimize(nll, theta0, method=method, options={"maxiter": maxiter, "gtol": tol})
+
+    theta_hat = res.x
+    beta_hat = theta_hat[:p]
+    gamma_hat = theta_hat[p : p + q]
+
+    # numeric Hessian for variance-covariance
+    def _numerical_hessian(func, x, eps: float = 1e-5) -> np.ndarray:
+        x = np.asarray(x, dtype=float)
+        n = x.size
+        H = np.zeros((n, n), dtype=float)
+        f0 = func(x)
+        for i in range(n):
+            ei = np.zeros(n)
+            ei[i] = eps
+            f_ip = func(x + ei)
+            f_im = func(x - ei)
+            H[i, i] = (f_ip - 2 * f0 + f_im) / (eps**2)
+            for j in range(i + 1, n):
+                ej = np.zeros(n)
+                ej[j] = eps
+                f_pp = func(x + ei + ej)
+                f_pm = func(x + ei - ej)
+                f_mp = func(x - ei + ej)
+                f_mm = func(x - ei - ej)
+                H_ij = (f_pp - f_pm - f_mp + f_mm) / (4 * eps**2)
+                H[i, j] = H_ij
+                H[j, i] = H_ij
+        return H
+
+    if use_numeric_hessian:
+        try:
+            H = _numerical_hessian(nll, theta_hat)
+            vcov_theta = np.linalg.inv(H)
+        except Exception:
+            vcov_theta = np.full((p + q, p + q), np.nan)
+    else:
+        if hasattr(res, "hess_inv"):
+            hess_inv = res.hess_inv
+            vcov_theta = np.asarray(hess_inv.todense()) if hasattr(hess_inv, "todense") else np.asarray(hess_inv)
+        else:
+            vcov_theta = np.full((p + q, p + q), np.nan)
+
+    se_all = np.sqrt(np.clip(np.diag(vcov_theta), 0.0, np.inf))
+    se_beta = se_all[:p]
+    se_gamma = se_all[p : p + q]
+
+    nobs = int(y_arr.shape[0])
+    n_left = int(is_left.sum())
+    n_right = int(is_right.sum())
+    n_unc = int(mask_unc.sum())
+    ll = -nll(theta_hat)
+    k_params = p + q
+    aic = 2 * k_params - 2 * ll
+    bic = np.log(nobs) * k_params - 2 * ll
+
+    return HeteroTobitResult(
+        beta=beta_hat,
+        gamma=gamma_hat,
+        vcov=vcov_theta,
+        se_beta=se_beta,
+        se_gamma=se_gamma,
+        loglike=float(ll),
+        nobs=nobs,
+        n_left=n_left,
+        n_right=n_right,
+        n_uncensored=n_unc,
+        success=bool(res.success),
+        message=str(res.message),
+        nit=int(res.nit) if hasattr(res, "nit") else -1,
+        aic=float(aic),
+        bic=float(bic),
+    )
