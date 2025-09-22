@@ -1,3 +1,4 @@
 *.venv/
-*-1s-2025-08.csv
+*.csv
 .ruff_cache/
+__pycache__/
