@@ -30,59 +30,76 @@ bids_0x95c0 = pl.read_csv("auction_records/bids_0x95c0.csv")
 auction_resolved = pl.read_csv("auction_records/auction_resolved.csv")
 
 
-# construct price data with timestamp converted to seconds and compute realized stats across all files
+# construct price data with timestamp converted to seconds and compute realized
+# stats across all files. This is wrapped into a function for reusability.
 RV_WINDOW = 60
 
-price = (
-    price_lazy.with_columns(
-        [
-            (pl.col("timestamp_us") / 1_000_000).cast(pl.Int64).alias("timestamp"),
-            pl.col("open").cast(pl.Float64),
-        ]
+def build_price_table(price_scan: pl.LazyFrame, window: int = RV_WINDOW) -> pl.DataFrame:
+    """
+    Build a single continuous price table from multiple 1-second CSVs.
+    - Convert microsecond timestamps to integer seconds.
+    - Compute log price and 1-second log returns.
+    - Compute realized variance (sum of squared returns over a trailing window)
+      and realized quarticity (n/3 * sum of quartic returns over the same window).
+    """
+    return (
+        price_scan.with_columns(
+            [
+                (pl.col("timestamp_us") / 1_000_000)
+                .cast(pl.Int64)
+                .alias("timestamp"),
+                pl.col("open").cast(pl.Float64),
+            ]
+        )
+        .select(["timestamp_us", "timestamp", "open"])  # ensure consistent projection
+        .sort("timestamp")
+        .with_columns([pl.col("open").log().alias("log_price")])
+        .with_columns(
+            [(pl.col("log_price") - pl.col("log_price").shift(1)).alias("log_return")]
+        )
+        .with_columns(
+            [
+                pl.col("log_return")
+                .pow(2)
+                .rolling_sum(window_size=window)
+                .alias("realized_variance"),
+                (
+                    (pl.lit(window) / 3)
+                    * pl.col("log_return").pow(4).rolling_sum(window_size=window)
+                ).alias("realized_quarticity"),
+            ]
+        )
+        .drop("timestamp_us")
+        .drop("open")
+        .collect()
     )
-    .select(["timestamp_us", "timestamp", "open"])  # ensure consistent projection
-    .sort("timestamp")
-    .with_columns(
-        [
-            pl.col("open").log().alias("log_price"),
-        ]
-    )
-    .with_columns(
-        [
-            (pl.col("log_price") - pl.col("log_price").shift(1)).alias("log_return"),
-        ]
-    )
-    .with_columns(
-        [
-            pl.col("log_return")
-            .pow(2)
-            .rolling_sum(window_size=RV_WINDOW)
-            .alias("realized_variance"),
-            (
-                (pl.lit(RV_WINDOW) / 3)
-                * pl.col("log_return").pow(4).rolling_sum(window_size=RV_WINDOW)
-            ).alias("realized_quarticity"),
-        ]
-    )
-    .drop("timestamp_us")
-    .drop("open")
-    .collect()
-)
 
-# select round timing from resolved data
-resolved_times = auction_resolved.select(
-    [
-        pl.col("round").cast(pl.Int64),
-        pl.col("round_start_timestamp").cast(pl.Int64),
-        pl.col("round_end_timestamp").cast(pl.Int64),
-    ]
-)
+price = build_price_table(price_lazy, window=RV_WINDOW)
+
+def build_resolved_times(resolved: pl.DataFrame) -> pl.DataFrame:
+    """
+    Prepare the resolved times table with integer-typed round and timestamps.
+    """
+    return resolved.select(
+        [
+            pl.col("round").cast(pl.Int64),
+            pl.col("round_start_timestamp").cast(pl.Int64),
+            pl.col("round_end_timestamp").cast(pl.Int64),
+        ]
+    )
+
+resolved_times = build_resolved_times(auction_resolved)
 
 MIN_ROUND = 205323
 MAX_ROUND = 249961
 
 
-def enrich_and_censor(bids_df: pl.DataFrame) -> pl.DataFrame:
+def build_complete_bids(
+    bids_df: pl.DataFrame,
+    resolved_times: pl.DataFrame,
+    min_round: int,
+    max_round: int,
+) -> pl.DataFrame:
     # cast types
     bids_typed = bids_df.with_columns(
         [
@@ -105,12 +122,12 @@ def enrich_and_censor(bids_df: pl.DataFrame) -> pl.DataFrame:
 
     # build full round range
     target_rounds = pl.DataFrame(
-        {"round": pl.arange(MIN_ROUND, MAX_ROUND + 1, eager=True, dtype=pl.Int64)}
+        {"round": pl.arange(min_round, max_round + 1, eager=True, dtype=pl.Int64)}
     )
 
     # resolved times for the full range (used to seed leading gaps)
     range_times = resolved_times.filter(
-        (pl.col("round") >= MIN_ROUND) & (pl.col("round") <= MAX_ROUND)
+        (pl.col("round") >= min_round) & (pl.col("round") <= max_round)
     ).rename(
         {
             "round_start_timestamp": "resolved_start",
@@ -235,26 +252,20 @@ def enrich_and_censor(bids_df: pl.DataFrame) -> pl.DataFrame:
     return out
 
 
+def attach_realized_to_bids(bids: pl.DataFrame, price_df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Attach realized statistics from price to bids using round_end_timestamp as key.
+    """
+    rv_lookup = price_df.select(["timestamp", "realized_variance", "realized_quarticity"])
+    return bids.join(rv_lookup, left_on="round_end_timestamp", right_on="timestamp", how="left")
+
+
 # process each bidder separately
-bids_0x8c6f_complete = enrich_and_censor(bids_0x8c6f)
-bids_0x95c0_complete = enrich_and_censor(bids_0x95c0)
+bids_0x8c6f_complete = build_complete_bids(bids_0x8c6f, resolved_times, MIN_ROUND, MAX_ROUND)
+bids_0x95c0_complete = build_complete_bids(bids_0x95c0, resolved_times, MIN_ROUND, MAX_ROUND)
 
-# attach realized stats from price at round_end_timestamp
-rv_lookup = price.select(
-    [
-        "timestamp",
-        "realized_variance",
-        "realized_quarticity",
-    ]
-)
-
-bids_0x8c6f_complete = bids_0x8c6f_complete.join(
-    rv_lookup, left_on="round_end_timestamp", right_on="timestamp", how="left"
-)
-
-bids_0x95c0_complete = bids_0x95c0_complete.join(
-    rv_lookup, left_on="round_end_timestamp", right_on="timestamp", how="left"
-)
+bids_0x8c6f_complete = attach_realized_to_bids(bids_0x8c6f_complete, price)
+bids_0x95c0_complete = attach_realized_to_bids(bids_0x95c0_complete, price)
 
 # print the first 10 rows of each dataset
 print("price data:")
@@ -277,140 +288,63 @@ RESERVE_WEI = 10**15
 WEI_PER_ETH = 10**18
 LEFT_ETH = RESERVE_WEI / WEI_PER_ETH
 
-# run regression for 0x8c6f
-df_8c6f = bids_0x8c6f_complete.filter(
-    pl.col("realized_variance").is_not_null()
-    & pl.col("realized_quarticity").is_not_null()
-)
-y_8c6f_eth = (df_8c6f["amount"].cast(pl.Float64).to_numpy()) / WEI_PER_ETH
-X_8c6f_raw = np.column_stack(
-    [
-        df_8c6f["realized_variance"].cast(pl.Float64).to_numpy(),  # mean of IV
-        df_8c6f["realized_quarticity"].cast(pl.Float64).to_numpy()
-        - df_8c6f["realized_variance"].cast(pl.Float64).to_numpy()
-        ** 2,  # variance of IV
-    ]
-)
-mu_X8 = X_8c6f_raw.mean(axis=0)
-sd_X8 = X_8c6f_raw.std(axis=0, ddof=1)
-sd_X8[sd_X8 == 0] = 1.0
-X_8c6f = (X_8c6f_raw - mu_X8) / sd_X8
 
-result = tobit.fit_tobit(y_8c6f_eth, X_8c6f, left=LEFT_ETH, use_numeric_hessian=True)
-
-# pretty print coefficients and t-stats
-names = ["const", "realized_variance", "realized_quarticity - realized_variance^2"]
-beta = result.beta
-se = result.se_beta
-tval = beta / se
-pval = 2 * norm.sf(np.abs(tval))
-
-print("\n=== Tobit coefficients (0x8c6f) ===")
-for i, name in enumerate(names[: len(beta)]):
-    print(
-        f"{name:>20}: beta={beta[i]: .6e}  se={se[i]: .6e}  t={tval[i]: .3f}  p={pval[i]: .3g}"
+def prepare_regression_data(bids_complete: pl.DataFrame) -> tuple[np.ndarray, np.ndarray, list[str], pl.DataFrame]:
+    """
+    Prepare regression arrays from a complete bids table.
+    - Filter rows to those with realized stats available.
+    - Scale y to ETH and standardize features.
+    - Use features: [realized_variance, realized_quarticity - realized_variance^2]
+      which loosely correspond to mean and variance of IV in microstructure theory.
+    Returns (y_eth, X_std, feature_names, df_filtered)
+    """
+    df = bids_complete.filter(
+        pl.col("realized_variance").is_not_null()
+        & pl.col("realized_quarticity").is_not_null()
     )
-print(f"loglike={result.loglike:.3f}  AIC={result.aic:.2f}  BIC={result.bic:.2f}")
+    y_eth = (df["amount"].cast(pl.Float64).to_numpy()) / WEI_PER_ETH
+    rv = df["realized_variance"].cast(pl.Float64).to_numpy()
+    rq = df["realized_quarticity"].cast(pl.Float64).to_numpy()
+    # Feature transform: RV and (RQ - RV^2)
+    X_raw = np.column_stack([rv, rq - rv ** 2])
+    mu = X_raw.mean(axis=0)
+    sd = X_raw.std(axis=0, ddof=1)
+    sd[sd == 0] = 1.0
+    X_std = (X_raw - mu) / sd
+    names_local = ["realized_variance", "realized_quarticity - realized_variance^2"]
+    return y_eth, X_std, names_local, df
 
-# residuals (latent): y - X beta (ETH units)
-mu_hat = tobit.predict_latent(X_8c6f, result.beta, add_intercept=True)
-resid_8c6f = y_8c6f_eth - mu_hat
 
-# distribution stats
-stats_8 = {
-    "n": resid_8c6f.size,
-    "mean": float(resid_8c6f.mean()),
-    "std": float(resid_8c6f.std(ddof=1)),
-    "min": float(np.min(resid_8c6f)),
-    "p05": float(np.percentile(resid_8c6f, 5)),
-    "p50": float(np.percentile(resid_8c6f, 50)),
-    "p95": float(np.percentile(resid_8c6f, 95)),
-    "max": float(np.max(resid_8c6f)),
-}
-print("Residual stats (0x8c6f):", stats_8)
+def print_coefficients(result, names: list[str], tag: str) -> None:
+    """Pretty-print coefficients, standard errors, t and p values."""
+    beta = result.beta
+    se = result.se_beta
+    tval = beta / se
+    pval = 2 * norm.sf(np.abs(tval))
+    print(f"\n=== Tobit coefficients ({tag}) ===")
+    for i, name in enumerate(names[: len(beta)]):
+        print(f"{name:>20}: beta={beta[i]: .6e}  se={se[i]: .6e}  t={tval[i]: .3f}  p={pval[i]: .3g}")
+    print(f"loglike={result.loglike:.3f}  AIC={result.aic:.2f}  BIC={result.bic:.2f}")
 
-# ensure image directory exists
-os.makedirs("images", exist_ok=True)
 
-# plots
-rounds_8 = df_8c6f["round"].to_numpy()
-fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
-axes[0].plot(rounds_8, resid_8c6f, lw=0.7)
-axes[0].set_title("Residuals vs Round (0x8c6f)")
-axes[0].set_xlabel("Round")
-axes[0].set_ylabel("Residual (ETH)")
-axes[1].hist(resid_8c6f, bins=50, alpha=0.85)
-axes[1].set_title("Residual distribution (0x8c6f)")
-fig.savefig("images/residuals_round_and_hist_0x8c6f.png", dpi=150)
-plt.close(fig)
-
-# run regression for 0x95c0
-df_95c0 = bids_0x95c0_complete.filter(
-    pl.col("realized_variance").is_not_null()
-    & pl.col("realized_quarticity").is_not_null()
-)
-y_95c0_eth = (df_95c0["amount"].cast(pl.Float64).to_numpy()) / WEI_PER_ETH
-X_95c0_raw = np.column_stack(
-    [
-        df_95c0["realized_variance"].cast(pl.Float64).to_numpy(),  # mean of IV
-        df_95c0["realized_quarticity"].cast(pl.Float64).to_numpy()
-        - df_95c0["realized_variance"].cast(pl.Float64).to_numpy()
-        ** 2,  # variance of IV
-    ]
-)
-mu_X95 = X_95c0_raw.mean(axis=0)
-sd_X95 = X_95c0_raw.std(axis=0, ddof=1)
-sd_X95[sd_X95 == 0] = 1.0
-X_95c0 = (X_95c0_raw - mu_X95) / sd_X95
-
-result = tobit.fit_tobit(y_95c0_eth, X_95c0, left=LEFT_ETH, use_numeric_hessian=True)
-
-# pretty print coefficients and t-stats
-beta = result.beta
-se = result.se_beta
-tval = beta / se
-pval = 2 * norm.sf(np.abs(tval))
-
-print("\n=== Tobit coefficients (0x95c0) ===")
-for i, name in enumerate(names[: len(beta)]):
-    print(
-        f"{name:>20}: beta={beta[i]: .6e}  se={se[i]: .6e}  t={tval[i]: .3f}  p={pval[i]: .3g}"
-    )
-print(f"loglike={result.loglike:.3f}  AIC={result.aic:.2f}  BIC={result.bic:.2f}")
-
-# residuals (latent) in ETH
-mu_hat = tobit.predict_latent(X_95c0, result.beta, add_intercept=True)
-resid_95 = y_95c0_eth - mu_hat
-stats_95 = {
-    "n": resid_95.size,
-    "mean": float(resid_95.mean()),
-    "std": float(resid_95.std(ddof=1)),
-    "min": float(np.min(resid_95)),
-    "p05": float(np.percentile(resid_95, 5)),
-    "p50": float(np.percentile(resid_95, 50)),
-    "p95": float(np.percentile(resid_95, 95)),
-    "max": float(np.max(resid_95)),
-}
-print("Residual stats (0x95c0):", stats_95)
-
-# plots
-rounds_95 = df_95c0["round"].to_numpy()
-fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
-axes[0].plot(rounds_95, resid_95, lw=0.7)
-axes[0].set_title("Residuals vs Round (0x95c0)")
-axes[0].set_xlabel("Round")
-axes[0].set_ylabel("Residual (ETH)")
-axes[1].hist(resid_95, bins=50, alpha=0.85)
-axes[1].set_title("Residual distribution (0x95c0)")
-fig.savefig("images/residuals_round_and_hist_0x95c0.png", dpi=150)
-plt.close(fig)
+def summarize_residuals(residuals: np.ndarray, tag: str) -> None:
+    """Print concise residual distribution statistics."""
+    stats = {
+        "n": residuals.size,
+        "mean": float(residuals.mean()),
+        "std": float(residuals.std(ddof=1)),
+        "min": float(np.min(residuals)),
+        "p05": float(np.percentile(residuals, 5)),
+        "p50": float(np.percentile(residuals, 50)),
+        "p95": float(np.percentile(residuals, 95)),
+        "max": float(np.max(residuals)),
+    }
+    print(f"Residual stats ({tag}):", stats)
 
 # additional plots: residual vs RV, scatter and QQ of y_hat vs y
 
 
-def plot_residual_vs_rv(
-    df: pl.DataFrame, residuals: np.ndarray, bidder_tag: str
-) -> None:
+def plot_residual_vs_rv(df: pl.DataFrame, residuals: np.ndarray, bidder_tag: str) -> None:
     rv = df["realized_variance"].cast(pl.Float64).to_numpy()
     fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
     ax.scatter(rv, residuals, s=6, alpha=0.6)
@@ -450,10 +384,49 @@ def plot_yhat_vs_y(mu_hat_arr: np.ndarray, y_arr: np.ndarray, bidder_tag: str) -
     plt.close(fig)
 
 
-# bidder 0x8c6f
-plot_residual_vs_rv(df_8c6f, resid_8c6f, "0x8c6f")
-plot_yhat_vs_y(mu_hat, y_8c6f_eth, "0x8c6f")
+def plot_residuals_round_hist(df: pl.DataFrame, residuals: np.ndarray, bidder_tag: str) -> None:
+    rounds = df["round"].to_numpy()
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
+    axes[0].plot(rounds, residuals, lw=0.7)
+    axes[0].set_title(f"Residuals vs Round ({bidder_tag})")
+    axes[0].set_xlabel("Round")
+    axes[0].set_ylabel("Residual (ETH)")
+    axes[1].hist(residuals, bins=50, alpha=0.85)
+    axes[1].set_title(f"Residual distribution ({bidder_tag})")
+    fig.savefig(f"images/residuals_round_and_hist_{bidder_tag}.png", dpi=150)
+    plt.close(fig)
 
-# bidder 0x95c0
-plot_residual_vs_rv(df_95c0, resid_95, "0x95c0")
-plot_yhat_vs_y(mu_hat, y_95c0_eth, "0x95c0")
+
+def run_bidder_regression(bids_complete: pl.DataFrame, bidder_tag: str) -> None:
+    """
+    Full pipeline per bidder: prepare data, fit Tobit, print coefficients and residual stats,
+    and generate robustness plots saved under images/.
+    """
+    # ensure images dir
+    os.makedirs("images", exist_ok=True)
+
+    # prepare regression arrays
+    y_eth, X_std, feature_names, df_filtered = prepare_regression_data(bids_complete)
+
+    # fit Tobit with left-censoring at reserve (in ETH)
+    import bid_and_volatility.tobit as tobit  # local import to keep top clean
+
+    res = tobit.fit_tobit(y_eth, X_std, left=LEFT_ETH, use_numeric_hessian=True)
+
+    # report
+    print_coefficients(res, ["const", *feature_names], bidder_tag)
+
+    # residuals and summaries
+    mu_hat_local = tobit.predict_latent(X_std, res.beta, add_intercept=True)
+    residuals_local = y_eth - mu_hat_local
+    summarize_residuals(residuals_local, bidder_tag)
+
+    # plots
+    plot_residuals_round_hist(df_filtered, residuals_local, bidder_tag)
+    plot_residual_vs_rv(df_filtered, residuals_local, bidder_tag)
+    plot_yhat_vs_y(mu_hat_local, y_eth, bidder_tag)
+
+
+# Run the regression/plotting pipeline for each bidder
+run_bidder_regression(bids_0x8c6f_complete, "0x8c6f")
+run_bidder_regression(bids_0x95c0_complete, "0x95c0")
