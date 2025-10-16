@@ -1,0 +1,39 @@
+===== Heteroskedastic Tobit (crch) with Student's t errors =====
+
+
+Call:
+crch::crch(formula = amount_s ~ RV_s + RQmRV2_s, data = df, dist = "student", 
+    left = left_vec_s, right = right_vec_s, scale.formula = ~lRV_s + 
+        lRQmRV2_s)
+
+Standardized residuals:
+      Min        1Q    Median        3Q       Max 
+-153.0338   -0.3895    0.0671    2.0538  506.1454 
+
+Coefficients (location model):
+             Estimate Std. Error z value Pr(>|z|)    
+(Intercept)  1.036009   0.008761  118.26   <2e-16 ***
+RV_s         2.584202   0.036409   70.98   <2e-16 ***
+RQmRV2_s    -0.086074   0.001722  -50.00   <2e-16 ***
+
+Coefficients (scale model with log link):
+            Estimate Std. Error z value Pr(>|z|)
+(Intercept)  0.01032    0.01138   0.907    0.364
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1 
+
+Distribution: student
+Df: 0.8403
+Log-likelihood: -1.049e+05 on 5 Df
+Number of iterations in BFGS optimization: 30 
+
+
+-- Notes --
+* Location (mean) model: amount ~ RV + (RQ - RV^2)
+* Scale model: log(sigma) ~ log(RV) + log(RQ - RV^2)
+* Censoring: left = 1e15; right = +Inf
+* Distribution: Student's t (robust to outliers / heavy tails)
+
+Observed-only Pearson R^2 (y vs yhat on uncensored): 0.268017
+Rows: total=44639, censored=7276, uncensored=37363
+Rounds: total=44639, censored=7276, uncensored=37363

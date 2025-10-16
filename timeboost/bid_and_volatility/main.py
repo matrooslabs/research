@@ -17,13 +17,6 @@ from bid_and_volatility.utils import (
     build_complete_bids,
     attach_realized_to_bids,
     prepare_regression_data,
-    print_coefficients,
-    summarize_residuals,
-    compute_r2s,
-    corr_inputs_with_residuals,
-    plot_residuals_round_hist,
-    plot_residual_vs_rv,
-    plot_yhat_vs_y,
 )
 import bid_and_volatility.tobit as tobit
 
@@ -34,14 +27,14 @@ import bid_and_volatility.tobit as tobit
 # load price and auction records
 # load all price csvs into a single big table (lazy scan with glob)
 price_lazy = pl.scan_csv(
-    "price/ETHUSDT-1s-*.csv",
+    "data/price/ETHUSDT-1s-*.csv",
     has_header=False,
     new_columns=["timestamp_us", "open"],
 )
 
-bids_0x8c6f = pl.read_csv("auction_records/bids_0x8c6f.csv")
-bids_0x95c0 = pl.read_csv("auction_records/bids_0x95c0.csv")
-auction_resolved = pl.read_csv("auction_records/auction_resolved.csv")
+bids_0x8c6f = pl.read_csv("data/auction_records/bids_0x8c6f.csv")
+bids_0x95c0 = pl.read_csv("data/auction_records/bids_0x95c0.csv")
+auction_resolved = pl.read_csv("data/auction_records/auction_resolved.csv")
 
 
 RV_WINDOW = 60
@@ -82,7 +75,7 @@ print(bids_0x95c0_complete.tail(10))
 
 # model: bid_amount ~ beta_var * realized_variance + beta_quar * realized_quarticity + beta_const + error
 
-"""Scale and fit Tobit: y in ETH, features standardized; left bound in ETH."""
+"""Fit Tobit: y in ETH, features unstandardized; left bound in ETH."""
 RESERVE_WEI = 10**15
 WEI_PER_ETH = 10**18
 LEFT_ETH = RESERVE_WEI / WEI_PER_ETH
@@ -91,117 +84,148 @@ LEFT_ETH = RESERVE_WEI / WEI_PER_ETH
 from bid_and_volatility.utils import prepare_regression_data as _prepare_regression_data
 
 
-def plot_residuals_round_hist(df: pl.DataFrame, residuals: np.ndarray, bidder_tag: str) -> None:
-    rounds = df["round"].to_numpy()
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
-    axes[0].plot(rounds, residuals, lw=0.7)
-    axes[0].set_title(f"Residuals vs Round ({bidder_tag})")
-    axes[0].set_xlabel("Round")
-    axes[0].set_ylabel("Residual (ETH)")
-    axes[1].hist(residuals, bins=50, alpha=0.85)
-    axes[1].set_title(f"Residual distribution ({bidder_tag})")
-    fig.savefig(f"images/residuals_round_and_hist_{bidder_tag}.png", dpi=150)
-    plt.close(fig)
+def _print_t_stats(tag: str, names: list[str], beta: np.ndarray, se_beta: np.ndarray) -> None:
+    tvals = beta[: len(se_beta)] / se_beta
+    header = f"t-statistics ({tag})"
+    print(f"\n=== {header} ===")
+    for i, name in enumerate(names[: len(tvals)]):
+        print(f"{name:>30}  t={tvals[i]: .3f}")
+
+
+def _print_loss_table(tag: str, rows: list[tuple[str, float, float]]) -> None:
+    # rows: (model_name, mse, qlike)
+    print(f"\n=== Loss comparison (MSE and QLIKE) ({tag}) ===")
+    print(f"{'model':>20}  {'MSE':>14}  {'QLIKE':>14}")
+    for name, mse, qlike in rows:
+        print(f"{name:>20}  {mse:14.6e}  {qlike:14.6e}")
 
 
 def run_bidder_regression(bids_complete: pl.DataFrame, bidder_tag: str) -> None:
     """
-    Full pipeline per bidder: prepare data, fit Tobit, print coefficients and residual stats,
-    and generate robustness plots saved under images/.
+    Full pipeline per bidder: prepare data, fit Tobit, and print only t-stats
+    and loss comparisons (MSE, QLIKE). Plots are skipped.
     """
-    # ensure images dir
-    os.makedirs("images", exist_ok=True)
 
-    # prepare regression arrays
-    y_eth, X_std, feature_names, df_filtered = _prepare_regression_data(bids_complete, WEI_PER_ETH)
+    # prepare regression arrays (use raw, unstandardized features)
+    y_eth, _X_ignored, feature_names, df_filtered = _prepare_regression_data(bids_complete, WEI_PER_ETH)
+    rv_arr = df_filtered["realized_variance"].cast(pl.Float64).to_numpy()
+    rq_arr = df_filtered["realized_quarticity"].cast(pl.Float64).to_numpy()
+    X_raw = np.column_stack([rv_arr, rq_arr - rv_arr ** 2])
 
     # fit Tobit with left-censoring at reserve (in ETH)
     import bid_and_volatility.tobit as tobit  # local import to keep top clean
 
-    res = tobit.fit_tobit(y_eth, X_std, left=LEFT_ETH, use_numeric_hessian=True)
+    res = tobit.fit_tobit(y_eth, X_raw, left=LEFT_ETH, use_numeric_hessian=True)
 
-    # report (heteroskedastic block will follow)
-    print_coefficients(res, ["const", *feature_names], f"{bidder_tag} (Tobit, homoskedastic)")
+    # report t-stats only for homoskedastic mean model
+    _print_t_stats(f"{bidder_tag} (Tobit, homoskedastic)", ["const", *feature_names], res.beta, res.se_beta)
 
-    # residuals and summaries, plus R^2 variants and input-residual correlations
-    mu_hat_local = tobit.predict_latent(X_std, res.beta, add_intercept=True)
-    residuals_local = y_eth - mu_hat_local
-    summarize_residuals(residuals_local, f"{bidder_tag} (homo)")
-    r2_p, r2_s = compute_r2s(y_eth, mu_hat_local)
-    print(f"R^2 (Pearson)={r2_p:.4f}, R^2 (Spearman)={r2_s:.4f}")
-    from bid_and_volatility.utils import print_corr_table, estimate_conditional_variance_ols, print_variance_table
-    corrs = corr_inputs_with_residuals(X_std, residuals_local, feature_names)
-    print_corr_table(corrs, f"{bidder_tag} (homo)")
-    var_uncond = float(np.var(residuals_local, ddof=1))
-    var_cond = estimate_conditional_variance_ols(X_std, residuals_local)
-    print_variance_table(var_uncond, var_cond, f"{bidder_tag} (homo)")
-
-    # plots for homoskedastic fit
-    plot_residuals_round_hist(df_filtered, residuals_local, bidder_tag)
-    plot_residual_vs_rv(df_filtered, residuals_local, bidder_tag)
-    plot_yhat_vs_y(mu_hat_local, y_eth, bidder_tag)
+    # predictions for loss metrics
+    mu_hat_local = tobit.predict_latent(X_raw, res.beta, add_intercept=True)
+    sigma2_local = float(res.sigma ** 2)
 
     # ================= Additional requested models and stats =================
     # 1) Tobit with only RV as input
-    rv_only = X_std[:, [0]]  # after standardization, column 0 is RV
+    rv_only = X_raw[:, [0]]  # column 0 is RV
     res_rv_only = tobit.fit_tobit(y_eth, rv_only, left=LEFT_ETH, use_numeric_hessian=True)
-    print_coefficients(res_rv_only, ["const", feature_names[0]], f"{bidder_tag} (RV only)")
+    _print_t_stats(f"{bidder_tag} (RV only)", ["const", feature_names[0]], res_rv_only.beta, res_rv_only.se_beta)
     mu_rv = tobit.predict_latent(rv_only, res_rv_only.beta, add_intercept=True)
-    r2p_rv, r2s_rv = compute_r2s(y_eth, mu_rv)
-    print(f"R^2 (Pearson)={r2p_rv:.4f}, R^2 (Spearman)={r2s_rv:.4f}")
-    resid_rv = y_eth - mu_rv
-    summarize_residuals(resid_rv, f"{bidder_tag} (RV only)")
-    corrs_rv = corr_inputs_with_residuals(rv_only, resid_rv, [feature_names[0]])
-    print_corr_table(corrs_rv, f"{bidder_tag} (RV only)")
-    var_uncond_rv = float(np.var(resid_rv, ddof=1))
-    var_cond_rv = estimate_conditional_variance_ols(rv_only, resid_rv)
-    print_variance_table(var_uncond_rv, var_cond_rv, f"{bidder_tag} (RV only)")
+    sigma2_rv = float(res_rv_only.sigma ** 2)
 
     # 2) Heteroskedastic Tobit with both RV and (RQ - RV^2) for mean and variance
-    #    - Mean: X_std (two columns)
+    #    - Mean: X_raw (two columns)
     #    - Variance: Z = [log(RV), log(RQ - RV^2)] with intercept for sigma
-    #      We stabilize logs with a small epsilon and standardize Z for numerics.
-    rv_arr = df_filtered["realized_variance"].cast(pl.Float64).to_numpy()
-    rq_arr = df_filtered["realized_quarticity"].cast(pl.Float64).to_numpy()
+    #      We stabilize logs with a small epsilon. No standardization.
     iv_var_arr = rq_arr - rv_arr ** 2
     eps = 1e-20
     Z_raw = np.column_stack([
         np.log(np.maximum(rv_arr, eps)),
         np.log(np.maximum(iv_var_arr, eps)),
     ])
-    mu_Z = Z_raw.mean(axis=0)
-    sd_Z = Z_raw.std(axis=0, ddof=1)
-    sd_Z[sd_Z == 0] = 1.0
-    Z_std = (Z_raw - mu_Z) / sd_Z
-    res_het = tobit.fit_tobit_hetero(
-        y_eth,
-        X_std,
-        Z=Z_std,
-        left=LEFT_ETH,
-        add_intercept=True,
-        add_intercept_sigma=True,
-        use_numeric_hessian=True,
-    )
-    from bid_and_volatility.utils import print_gamma_table
-    print_coefficients(res_het, ["const", *feature_names], f"{bidder_tag} (hetero mean)")
-    print_gamma_table(res_het.gamma, res_het.se_gamma, ["const_sigma", *feature_names], f"{bidder_tag}")
+    # Try heteroskedastic normal Tobit
+    loss_rows: list[tuple[str, float, float]] = []
+    eps_var = 1e-20
+    mse_homo = float(np.mean((y_eth - mu_hat_local) ** 2))
+    qlike_homo = float(np.mean(np.log(np.maximum(sigma2_local, eps_var)) + (y_eth - mu_hat_local) ** 2 / np.maximum(sigma2_local, eps_var)))
+    loss_rows.append(("Homoskedastic", mse_homo, qlike_homo))
+    mse_rv = float(np.mean((y_eth - mu_rv) ** 2))
+    qlike_rv = float(np.mean(np.log(np.maximum(sigma2_rv, eps_var)) + (y_eth - mu_rv) ** 2 / np.maximum(sigma2_rv, eps_var)))
+    loss_rows.append(("RV only", mse_rv, qlike_rv))
 
-    # predictions and stats for heteroskedastic model
-    mu_hat_het = tobit.predict_latent(X_std, res_het.beta, add_intercept=True)
-    r2p_het, r2s_het = compute_r2s(y_eth, mu_hat_het)
-    print(f"R^2 (Pearson)={r2p_het:.4f}, R^2 (Spearman)={r2s_het:.4f}")
-    resid_het = y_eth - mu_hat_het
-    summarize_residuals(resid_het, f"{bidder_tag} (hetero)")
-    corrs_het = corr_inputs_with_residuals(X_std, resid_het, feature_names)
-    print_corr_table(corrs_het, f"{bidder_tag} (hetero)")
-    var_uncond_het = float(np.var(resid_het, ddof=1))
-    var_cond_het = estimate_conditional_variance_ols(X_std, resid_het)
-    print_variance_table(var_uncond_het, var_cond_het, f"{bidder_tag} (hetero)")
+    res_het = None
+    try:
+        res_het = tobit.fit_tobit_hetero(
+            y_eth,
+            X_raw,
+            Z=Z_raw,
+            left=LEFT_ETH,
+            add_intercept=True,
+            add_intercept_sigma=True,
+            use_numeric_hessian=True,
+        )
+    except Exception as e:
+        print(f"[warn] heteroskedastic Tobit failed: {e}")
+
+    if res_het is not None and hasattr(res_het, "beta") and hasattr(res_het, "gamma"):
+        _print_t_stats(f"{bidder_tag} (hetero mean)", ["const", *feature_names], res_het.beta, res_het.se_beta)
+        t_gamma = res_het.gamma / res_het.se_gamma
+        print(f"\n=== t-statistics (sigma model) ({bidder_tag}) ===")
+        for nm, tv in zip(["const_sigma", *feature_names], t_gamma):
+            print(f"{nm:>30}  t={tv: .3f}")
+
+        mu_hat_het = tobit.predict_latent(X_raw, res_het.beta, add_intercept=True)
+        sigma_i = np.exp(np.column_stack([
+            np.ones(Z_raw.shape[0]), Z_raw
+        ]) @ res_het.gamma)
+        sigma2_i = sigma_i ** 2
+        resid_het = y_eth - mu_hat_het
+        mse_het = float(np.mean(resid_het ** 2))
+        qlike_het = float(np.mean(np.log(np.maximum(sigma2_i, eps_var)) + resid_het ** 2 / np.maximum(sigma2_i, eps_var)))
+        loss_rows.append(("Heteroskedastic", mse_het, qlike_het))
+    else:
+        print("[info] Skipping heteroskedastic (normal) section due to failed fit.")
+
+    # Heteroskedastic Tobit with Student-t residuals
+    res_het_t = None
+    try:
+        res_het_t = tobit.fit_tobit_hetero_t(
+            y_eth,
+            X_raw,
+            Z=Z_raw,
+            left=LEFT_ETH,
+            add_intercept=True,
+            add_intercept_sigma=True,
+            use_numeric_hessian=True,
+        )
+    except Exception as e:
+        print(f"[warn] heteroskedastic-t Tobit failed: {e}")
+
+    if res_het_t is not None and hasattr(res_het_t, "beta") and hasattr(res_het_t, "gamma"):
+        _print_t_stats(f"{bidder_tag} (hetero-t mean)", ["const", *feature_names], res_het_t.beta, res_het_t.se_beta)
+        t_gamma_t = res_het_t.gamma / res_het_t.se_gamma
+        print(f"\n=== t-statistics (sigma model, t) ({bidder_tag}) ===")
+        for nm, tv in zip(["const_sigma", *feature_names], t_gamma_t):
+            print(f"{nm:>30}  t={tv: .3f}")
+
+        mu_hat_t = tobit.predict_latent(X_raw, res_het_t.beta, add_intercept=True)
+        sigma_t_i = np.exp(np.column_stack([
+            np.ones(Z_raw.shape[0]), Z_raw
+        ]) @ res_het_t.gamma)
+        resid_t = y_eth - mu_hat_t
+        nu = float(res_het_t.nu)
+        var_t_i = (nu / (nu - 2.0)) * (sigma_t_i ** 2)
+        mse_t = float(np.mean(resid_t ** 2))
+        qlike_t = float(np.mean(np.log(np.maximum(var_t_i, eps_var)) + resid_t ** 2 / np.maximum(var_t_i, eps_var)))
+        loss_rows.append(("Heteroskedastic-t", mse_t, qlike_t))
+    else:
+        print("[info] Skipping heteroskedastic (Student-t) section due to failed fit.")
+
+    _print_loss_table(bidder_tag, loss_rows)
 
 
 # Run the regression/plotting pipeline for each bidder
-run_bidder_regression(bids_0x8c6f_complete, "0x8c6f")
-run_bidder_regression(bids_0x95c0_complete, "0x95c0")
+# run_bidder_regression(bids_0x8c6f_complete, "0x8c6f")
+# run_bidder_regression(bids_0x95c0_complete, "0x95c0")
 
 ##############################################################################
 #            run regression: heteroskedastic tobit with RV and RQ            #
