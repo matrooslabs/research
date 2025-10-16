@@ -1,0 +1,27 @@
+LR test summary generated on 2025-10-13 17:43:21
+
+==============================
+Bidder: 0x8c6f
+Models compared: RV_only (reduced) vs RV_RQmRV2 (full)
+LogLik (reduced): -105229.241  | df: 4
+LogLik (full):    -104878.948  | df: 5
+LR stat: 700.586  | df diff: 1  | p-value: 2.23e-154
+AIC (reduced): 210466.482  | BIC (reduced): 210501.308
+AIC (full):    209767.896  | BIC (full):    209811.428
+Delta AIC (full - reduced): -698.586
+Delta BIC (full - reduced): -689.880
+McFadden R^2 (reduced vs null): 0.034728
+McFadden R^2 (full vs null):    0.037941
+
+==============================
+Bidder: 0x95c0
+Models compared: RV_only (reduced) vs RV_RQmRV2 (full)
+LogLik (reduced): -94026.122  | df: 4
+LogLik (full):    -93462.779  | df: 5
+LR stat: 1126.687  | df diff: 1  | p-value: 5.233e-247
+AIC (reduced): 188060.244  | BIC (reduced): 188095.070
+AIC (full):    186935.558  | BIC (full):    186979.089
+Delta AIC (full - reduced): -1124.687
+Delta BIC (full - reduced): -1115.980
+McFadden R^2 (reduced vs null): 0.050213
+McFadden R^2 (full vs null):    0.055903
